@@ -1,0 +1,113 @@
+# BLE Beacon (Rolling ID + Secure Broadcast)
+
+## Overview
+
+A low-power BLE beacon that continuously broadcasts a **changing (rolling) identity** which is still **verifiable** using a shared secret.
+
+No connections, no pairing — only periodic broadcasting.
+
+---
+
+## Core Idea
+
+Instead of a static ID:
+→ the beacon generates a **new identity over time**
+
+Goal:
+
+* prevent tracking
+* maintain authenticity
+
+---
+
+## Payload Structure
+
+Each broadcast contains:
+
+* Magic      → identifier (e.g., 0xBE)
+* Version    → format version
+* Device ID  → unique per beacon
+* Timestamp  → uptime-based (changes over time)
+* HMAC       → authentication signature
+
+---
+
+## Core Logic
+
+### 1. Generate Identity
+
+* Read current uptime (timestamp)
+* Combine with device_id
+
+→ this defines current identity
+
+---
+
+### 2. Sign Payload
+
+* Compute HMAC(device_id + timestamp, secret_key)
+* Truncate result (compact)
+
+→ ensures data authenticity
+
+---
+
+### 3. Build Packet
+
+* Insert all fields into BLE manufacturer data
+* Keep within size limit (~31 bytes)
+
+---
+
+### 4. Broadcast
+
+* Start non-connectable BLE advertising
+* Transmit repeatedly at fixed interval (~100–500 ms)
+
+---
+
+### 5. Rolling Update (periodic)
+
+Every N seconds:
+
+* Stop advertising
+* Generate new timestamp
+* Recompute HMAC
+* Restart advertising
+
+→ identity changes over time
+
+---
+
+### 6. Self-Recovery
+
+* If advertising stops:
+  → restart automatically
+
+---
+
+## Behavior Summary
+
+Loop:
+
+* Broadcast current payload
+* Periodically refresh identity
+* Always remain stateless
+
+---
+
+## Design Properties
+
+* Stateless (no connection, no memory of clients)
+* Lightweight (small payload, low CPU)
+* Secure (HMAC verification)
+* Private (rolling identity)
+
+---
+
+## Key Insight
+
+The beacon is not just transmitting data.
+
+It is:
+→ continuously generating and broadcasting a **time-based, signed identity**

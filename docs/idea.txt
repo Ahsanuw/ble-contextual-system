@@ -1,0 +1,51 @@
+Project: Energy-Efficient Context-Aware System Using BLE Presence Detection
+
+Goal:
+Menentukan ruangan tempat seseorang berada menggunakan BLE RSSI (bukan koordinat presisi), lalu mengontrol perangkat (lampu/AC) untuk hemat energi.
+
+Core Concept:
+- Beacon (ESP32) broadcast BLE (nama: "hackathon" atau ID terenkripsi)
+- Sensor nodes (ESP32-C3 / ESP32) scan RSSI
+- Controller (ESP32/Laptop) bandingkan RSSI antar node
+- RSSI terbesar = ruangan aktif
+
+Architecture:
+[Beacon] → [Sensor Node 1]
+          → [Sensor Node 2] → [Controller] → [Actuator/UI]
+          → [Sensor Node 3]
+
+Key Features:
+- Real-time RSSI
+- Smoothing (moving average)
+- Room classification (ROOM / NEAR / FAR)
+- Timeout (no signal)
+- Multi-node comparison
+- Optional: encryption / rolling ID (privacy)
+
+RSSI Logic:
+- > -65 dBm  : ROOM
+- -65 to -80 : NEAR
+- < -80      : FAR
+
+Tech Stack:
+- ESP-IDF (C) for beacon & sensor nodes
+- Python (Bleak + Rich) for controller UI (testing signal)
+- Linux (BlueZ) for BLE stack
+
+Why It Works:
+- BLE signal melemah karena jarak & dinding
+- Gunakan interferensi sebagai “feature”, bukan bug
+
+Limitations:
+- RSSI noisy → perlu smoothing
+- Tidak akurat untuk posisi detail (hanya level ruangan)
+
+Extensions:
+- Web dashboard
+- MQTT / WiFi communication
+- Energy analytics (berapa hemat)
+- Multi-user detection
+- Encrypted / rotating beacon ID
+
+Use Case:
+Smart home, kos, kelas, kantor (hemat listrik berbasis presence)
