@@ -58,9 +58,9 @@
 /* ============================================================
  *  CONFIGURATION — edit before flashing
  * ============================================================ */
-#define WIFI_SSID           "Griya Raisya 2"          // WiFi network name
-#define WIFI_PASS           "13raisya"      // WiFi password
-#define MQTT_BROKER_URI     "mqtt://192.168.1.100:1883" // MQTT broker IP
+#define WIFI_SSID           "KOST DAVA"          // WiFi network name
+#define WIFI_PASS           "davahafiz"      // WiFi password
+#define MQTT_BROKER_URI     "mqtt://192.168.100.100:1883" // MQTT broker IP
 #define NODE_ID             1                   // Unique ID for this sensor node
 #define SECRET_KEY          "hackathon2026"     // Must match beacon firmware
 #define COMPANY_ID          0x05AC              // Must match beacon firmware
