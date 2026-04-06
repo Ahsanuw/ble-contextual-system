@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Presence Controller</title>
+    <style>
+        *{box-sizing:border-box;margin:0;padding:0}
+        body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh;padding:24px}
+        h1{font-size:1.4rem;font-weight:500;color:#94a3b8;margin-bottom:24px}
+        h1 span{color:#38bdf8}
+        .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;margin-bottom:24px}
+        .card{background:#1e293b;border-radius:12px;padding:20px;border:1px solid #334155;transition:border-color .3s}
+        .card.active{border-color:#38bdf8;background:#0f2a3f}
+        .room-name{font-size:1rem;font-weight:500;color:#94a3b8;margin-bottom:12px}
+        .card.active .room-name{color:#38bdf8}
+        .rssi{font-size:2rem;font-weight:500;color:#e2e8f0;line-height:1}
+        .rssi-unit{font-size:0.8rem;color:#64748b;margin-left:4px}
+        .state-badge{display:inline-block;padding:3px 10px;border-radius:99px;font-size:0.75rem;font-weight:500;margin-top:10px}
+        .ROOM{background:#064e3b;color:#34d399}
+        .NEAR{background:#451a03;color:#fb923c}
+        .FAR{background:#1e1b4b;color:#818cf8}
+        .NO_SIGNAL{background:#1e1e1e;color:#4b5563}
+        .relay-row{display:flex;gap:8px;margin-top:14px}
+        .relay{flex:1;text-align:center;padding:6px 4px;border-radius:6px;font-size:0.72rem;font-weight:500}
+        .relay.on{background:#064e3b;color:#34d399}
+        .relay.off{background:#1e293b;color:#475569;border:1px solid #334155}
+        .hmac{font-size:0.7rem;margin-top:8px;color:#475569}
+        .hmac.ok{color:#34d399}
+        .energy{background:#1e293b;border-radius:12px;padding:20px;border:1px solid #334155}
+        .energy h2{font-size:0.85rem;font-weight:500;color:#64748b;margin-bottom:16px;text-transform:uppercase;letter-spacing:.05em}
+        .energy-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+        .stat-val{font-size:1.5rem;font-weight:500;color:#38bdf8}
+        .stat-label{font-size:0.72rem;color:#64748b;margin-top:2px}
+        .dot{width:8px;height:8px;border-radius:50%;background:#34d399;display:inline-block;margin-right:6px;animation:pulse 2s infinite}
+        @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+        .footer{margin-top:16px;font-size:0.72rem;color:#334155;text-align:right}
+        .status-bar{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap}
+        .badge{padding:4px 10px;border-radius:6px;font-size:0.72rem;font-weight:500;background:#1e293b;border:1px solid #334155;color:#64748b}
+        .badge.ok{border-color:#065f46;color:#34d399;background:#022c22}
+        .badge.warn{border-color:#78350f;color:#fb923c;background:#2d1a07}
+    </style>
+</head>
+<body>
+
+<h1>
+    <span class="dot"></span>
+    Presence Controller &mdash; <span>Energy Saving System</span>
+</h1>
+
+<div class="status-bar">
+    <div class="badge" id="badge-mqtt">MQTT: connecting...</div>
+    <div class="badge" id="badge-active">Active room: -</div>
+    <div class="badge" id="badge-switches">Switches: 0</div>
+    <div class="badge" id="badge-uptime">Uptime: -</div>
+</div>
+
+<div class="grid" id="rooms">
+    <p style="color:#475569">Loading...</p>
+</div>
+
+<div class="energy">
+    <h2>Energy savings this session</h2>
+    <div class="energy-grid">
+        <div>
+            <div class="stat-val" id="kwh">0.000</div>
+            <div class="stat-label">kWh saved</div>
+        </div>
+        <div>
+            <div class="stat-val" id="rp">Rp 0</div>
+            <div class="stat-label">cost avoided</div>
+        </div>
+        <div>
+            <div class="stat-val" id="co2">0 g</div>
+            <div class="stat-label">CO&#8322; offset</div>
+        </div>
+    </div>
+</div>
+
+<div class="footer">
+    Auto-refresh every 1s &nbsp;|&nbsp;
+    Nodes: <span id="nc">-</span> &nbsp;|&nbsp;
+    Last update: <span id="last-update">-</span>
+</div>
+
+<script>
+    let startTime = Date.now();
+
+    function formatUptime(ms) {
+        let s = Math.floor(ms / 1000);
+        let m = Math.floor(s / 60); s %= 60;
+        let h = Math.floor(m / 60); m %= 60;
+        if (h > 0) return h + 'h ' + m + 'm';
+        if (m > 0) return m + 'm ' + s + 's';
+        return s + 's';
+    }
+
+    function setBadge(id, text, state) {
+        const el = document.getElementById(id);
+        el.textContent = text;
+        el.className = 'badge ' + (state || '');
+    }
+
+    async function refresh() {
+        try {
+            const r = await fetch('/api/state');
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            const d = await r.json();
+
+            /* Energy panel */
+            document.getElementById('kwh').textContent  = d.energy.kwh_saved.toFixed(3);
+            document.getElementById('rp').textContent   = 'Rp ' + Math.round(d.energy.rupiah_saved).toLocaleString();
+            document.getElementById('co2').textContent  = d.energy.co2_gram.toFixed(0) + ' g';
+
+            /* Status bar */
+            setBadge('badge-mqtt',
+                d.mqtt ? 'MQTT: connected' : 'MQTT: disconnected',
+                d.mqtt ? 'ok' : 'warn');
+
+            setBadge('badge-active',
+                d.active_room >= 0 ? 'Active: ' + d.rooms[d.active_room].name : 'Active room: none',
+                d.active_room >= 0 ? 'ok' : '');
+
+            setBadge('badge-switches', 'Switches: ' + d.energy.room_switches);
+            setBadge('badge-uptime',   'Uptime: ' + formatUptime(Date.now() - startTime));
+
+            document.getElementById('nc').textContent = d.rooms.length;
+            document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+
+            /* Room cards */
+            const grid = document.getElementById('rooms');
+            grid.innerHTML = d.rooms.map(function(room) {
+                return [
+                    '<div class="card ' + (room.active ? 'active' : '') + '">',
+                    '<div class="room-name">' + (room.active ? '&#9654; ' : '') + room.name + '</div>',
+                    '<div class="rssi">' + room.rssi.toFixed(1) + '<span class="rssi-unit">dBm</span></div>',
+                    '<span class="state-badge ' + room.state + '">' + room.state.replace('_', ' ') + '</span>',
+                    '<div class="relay-row">',
+                    '<div class="relay ' + (room.light ? 'on' : 'off') + '">LIGHT ' + (room.light ? 'ON' : 'OFF') + '</div>',
+                    '<div class="relay ' + (room.ac    ? 'on' : 'off') + '">AC '    + (room.ac    ? 'ON' : 'OFF') + '</div>',
+                    '</div>',
+                    '<div class="hmac ' + (room.hmac ? 'ok' : '') + '">',
+                    'HMAC: ' + (room.hmac ? 'verified' : 'unverified'),
+                    '</div>',
+                    '</div>'
+                ].join('');
+            }).join('');
+
+        } catch (e) {
+            setBadge('badge-mqtt', 'Connection error', 'warn');
+        }
+    }
+
+    refresh();
+    setInterval(refresh, 1000);
+</script>
+</body>
+</html>
