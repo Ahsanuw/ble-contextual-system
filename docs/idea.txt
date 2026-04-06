@@ -1,51 +1,799 @@
-Project: Energy-Efficient Context-Aware System Using BLE Presence Detection
+================================================================
+  PROJECT: Energy-Efficient Context-Aware System
+           Using BLE Presence Detection
+  DOCUMENTATION FOR LLM CONSUMPTION
+  Language: English (technical) + Indonesian (explanations)
+  Version: 1.0
+================================================================
 
-Goal:
-Menentukan ruangan tempat seseorang berada menggunakan BLE RSSI (bukan koordinat presisi), lalu mengontrol perangkat (lampu/AC) untuk hemat energi.
+This document explains the complete system — architecture,
+firmware logic, signal processing, security, and communication
+stack — so that any LLM or developer can understand, extend,
+or debug the project without needing the original authors.
 
-Core Concept:
-- Beacon (ESP32) broadcast BLE (nama: "hackathon" atau ID terenkripsi)
-- Sensor nodes (ESP32-C3 / ESP32) scan RSSI
-- Controller (ESP32/Laptop) bandingkan RSSI antar node
-- RSSI terbesar = ruangan aktif
+================================================================
+  SECTION 1: PROBLEM STATEMENT
+================================================================
 
-Architecture:
-[Beacon] → [Sensor Node 1]
-          → [Sensor Node 2] → [Controller] → [Actuator/UI]
-          → [Sensor Node 3]
+WHAT PROBLEM DOES THIS SOLVE?
+Energy is wasted when lights and air conditioners remain ON
+in empty rooms. This is a universal problem in homes, boarding
+houses (kos), classrooms, and offices. Existing solutions:
 
-Key Features:
-- Real-time RSSI
-- Smoothing (moving average)
-- Room classification (ROOM / NEAR / FAR)
-- Timeout (no signal)
-- Multi-node comparison
-- Optional: encryption / rolling ID (privacy)
+  - PIR sensors: detect motion only, false negatives when
+    person sits still (e.g. reading, working at desk)
+  - Cameras: privacy-invasive, expensive, overkill
+  - Manual switching: humans forget
 
-RSSI Logic:
-- > -65 dBm  : ROOM
-- -65 to -80 : NEAR
-- < -80      : FAR
+THIS SYSTEM'S APPROACH:
+A person carries a small BLE beacon (ESP32). Fixed sensor
+nodes (ESP32-C3) in each room listen for the beacon's signal
+strength (RSSI). The room where RSSI is strongest = the room
+where the person is. Devices in that room turn ON; all others
+turn OFF.
 
-Tech Stack:
-- ESP-IDF (C) for beacon & sensor nodes
-- Python (Bleak + Rich) for controller UI (testing signal)
-- Linux (BlueZ) for BLE stack
+WHY BLE RSSI WORKS FOR THIS:
+  - BLE signal weakens with distance (inverse square law)
+  - Walls and obstacles attenuate signal further
+  - This "interference" becomes a feature: signals from the
+    next room are naturally weaker
+  - Room-level granularity (~85-90% accuracy) is sufficient
+    for energy control — we don't need sub-meter precision
 
-Why It Works:
-- BLE signal melemah karena jarak & dinding
-- Gunakan interferensi sebagai “feature”, bukan bug
+================================================================
+  SECTION 2: SYSTEM ARCHITECTURE
+================================================================
 
-Limitations:
-- RSSI noisy → perlu smoothing
-- Tidak akurat untuk posisi detail (hanya level ruangan)
+COMPONENTS:
+  1. Beacon       — ESP32, carried by person
+  2. Sensor Node  — ESP32-C3 (one per room), fixed position
+  3. Controller   — Laptop/RPi or ESP32, runs logic + UI
+  4. Actuator     — Relay controlling lights/AC
+  5. Dashboard    — Web UI showing live RSSI + energy savings
 
-Extensions:
-- Web dashboard
-- MQTT / WiFi communication
-- Energy analytics (berapa hemat)
-- Multi-user detection
-- Encrypted / rotating beacon ID
+DATA FLOW:
+  [Beacon] --BLE adv--> [Sensor Node 1 (living room)]
+                    --> [Sensor Node 2 (bedroom)]      --> [MQTT Broker] --> [Controller] --> [Relay/Actuator]
+                    --> [Sensor Node 3 (kitchen)]
 
-Use Case:
-Smart home, kos, kelas, kantor (hemat listrik berbasis presence)
+COMMUNICATION LAYERS:
+  Beacon    → Sensor Node : BLE (Bluetooth Low Energy), one-way
+  Sensor    → Controller  : WiFi + MQTT (publish/subscribe)
+  Controller → Actuator   : GPIO relay or IR signal
+  Controller → Dashboard  : WebSocket or HTTP
+
+MQTT TOPIC STRUCTURE:
+  presence/node{N}/beacon/{device_id}
+  Example: presence/node1/beacon/1
+
+  Payload (JSON):
+  {
+    "node_id": 1,           -- which room's sensor
+    "device_id": 1,         -- which beacon (which person)
+    "rssi_raw": -62,        -- raw RSSI in dBm
+    "rssi_filtered": -63.4, -- Kalman-smoothed RSSI
+    "state": "ROOM",        -- classification result
+    "hmac_ok": true,        -- was the packet authenticated?
+    "beacon_ts": 121,       -- beacon uptime in seconds
+    "timeout": false        -- has beacon disappeared?
+  }
+
+ROOM CLASSIFICATION LOGIC:
+  rssi_filtered > -65 dBm  → STATE_ROOM      (person is here)
+  rssi_filtered > -80 dBm  → STATE_NEAR      (person is close)
+  rssi_filtered <= -80 dBm → STATE_FAR       (person is far)
+  no packet for 5 seconds  → STATE_NO_SIGNAL (out of range)
+
+CONTROLLER DECISION RULE:
+  For each room, collect rssi_filtered from its sensor node.
+  The room with the highest rssi_filtered = active room.
+  Turn ON devices in active room, turn OFF all others.
+  If all nodes report NO_SIGNAL → person left → turn OFF all.
+
+================================================================
+  SECTION 3: BEACON FIRMWARE LOGIC (beacon_main.c)
+================================================================
+
+TARGET CHIP: ESP32 (classic)
+FRAMEWORK: ESP-IDF v5.x (C language)
+
+--- 3.1 BLE ADVERTISING ---
+
+The beacon broadcasts a BLE packet every 100-120ms.
+This is called "advertising" — the beacon does not wait for
+connections, it just keeps shouting its packet into the air.
+
+ADV_TYPE_NONCONN_IND is used:
+  - Non-connectable: no device can pair/connect to it
+  - Indication: broadcast-only, no response expected
+  - Saves power: no connection management overhead
+  - More secure: no attack surface from BLE connections
+
+Advertising interval: 100ms min, 120ms max
+  (0x00A0 * 0.625ms = 100ms, 0x00C0 * 0.625ms = 120ms)
+  This is a BLE spec unit — all intervals in multiples of 0.625ms
+
+TX Power: ESP_PWR_LVL_N0 = 0 dBm
+  Adjust based on room size. Higher = more range but more power.
+  -3 dBm saves power for small rooms.
+
+--- 3.2 PAYLOAD STRUCTURE ---
+
+The raw BLE advertising packet structure:
+  [BLE PDU header][MAC address][AD structures...]
+
+Inside AD structures, we use type 0xFF (Manufacturer Specific):
+  [length][0xFF][company_id_lo][company_id_hi][our payload...]
+
+Our payload (beacon_payload_t, 11 bytes total):
+  Byte 0    : magic    = 0xBE  (identifies our frame)
+  Byte 1    : version  = 0x01  (for future compatibility)
+  Byte 2    : device_id        (unique per beacon, 0x01-0xFF)
+  Bytes 3-6 : timestamp        (ESP uptime in seconds, uint32 LE)
+  Bytes 7-10: hmac[4]          (first 4 bytes of HMAC-SHA256)
+
+WHY MANUFACTURER SPECIFIC DATA (0xFF)?
+  It's the only AD type that allows arbitrary custom payload.
+  We claim company ID 0x05AC (not an officially registered ID,
+  just a non-conflicting value for hackathon use).
+
+IMPORTANT: Bleak (Python BLE library) automatically strips the
+  company ID bytes before giving you the data. So when Python
+  reads mfr_data[0x05AC], it gets bytes 0-10 above, NOT the
+  full AD structure.
+
+--- 3.3 ROLLING ID ---
+
+The beacon changes its identity every ROLL_INTERVAL_MS (60s).
+This is a privacy feature: a passive observer cannot track the
+beacon across time because the packet looks different each roll.
+
+HOW IT WORKS:
+  1. Timer fires every 60 seconds (FreeRTOS software timer)
+  2. Timer callback spawns roll_task (see Section 3.5)
+  3. roll_task stops advertising, waits 50ms, restarts with
+     a new payload that has current uptime as timestamp
+  4. New timestamp → new HMAC → packet looks different
+
+NOTE ON TIMESTAMP:
+  We use ESP uptime (esp_timer_get_time() / 1e6) as timestamp,
+  NOT Unix time. This means:
+  - No RTC or NTP required
+  - Timestamp resets to 0 on reboot
+  - Sufficient for rolling ID within one session
+  - Controller must not rely on timestamp for absolute time
+
+--- 3.4 HMAC-SHA256 AUTHENTICATION ---
+
+PURPOSE: Prevent fake beacons. If someone broadcasts a BLE
+packet with name "hackathon", the sensor node would accept it
+unless we verify a cryptographic signature.
+
+HOW HMAC WORKS HERE:
+
+  INPUT  = [device_id, ts_byte0, ts_byte1, ts_byte2, ts_byte3]
+  KEY    = SECRET_KEY ("hackathon2025")
+  OUTPUT = HMAC-SHA256(KEY, INPUT) → 32 bytes
+  SENT   = first 4 bytes only (truncated signature)
+
+  Firmware (C):
+    mbedtls_md_hmac_starts(&ctx, SECRET_KEY, strlen(SECRET_KEY));
+    mbedtls_md_hmac_update(&ctx, input, 5);
+    mbedtls_md_hmac_finish(&ctx, full_hmac);
+    memcpy(out_4b, full_hmac, 4);
+
+  Python verification:
+    import hmac as hmac_mod, hashlib
+    expected = hmac_mod.new(
+        SECRET_KEY.encode("utf-8"),
+        input_bytes,
+        hashlib.sha256
+    ).digest()[:4]
+    return hmac_mod.compare_digest(expected, received_hmac)
+
+CRITICAL: Both sides must use IDENTICAL:
+  - SECRET_KEY string (same characters, same encoding UTF-8)
+  - Input byte order (device_id first, then timestamp LE)
+  - Truncation to first 4 bytes
+
+WHY ONLY 4 BYTES?
+  BLE advertising payload max is 31 bytes. Full HMAC (32 bytes)
+  won't fit alongside our other data. 4 bytes = 2^32 = 4 billion
+  possible values. Probability of a random packet passing = 1/4B.
+  Sufficient for a hackathon/IoT use case.
+
+SECURITY LIMITATION:
+  4-byte HMAC is NOT production cryptography. It can be brute-
+  forced in ~minutes on modern hardware. For real deployment,
+  use rotating keys or a proper challenge-response protocol.
+
+--- 3.5 FREERTOS TASK ARCHITECTURE ---
+
+Three concurrent execution contexts in beacon firmware:
+
+  1. app_main task (created automatically by ESP-IDF)
+     - Initializes everything
+     - Runs watchdog loop every 5 seconds
+     - If s_adv_active == false AND s_rolling == false:
+       restart advertising (recovery from unexpected stop)
+
+  2. FreeRTOS Timer Daemon task (built-in)
+     - Manages all software timers in the system
+     - Fires roll_timer_cb() every 60 seconds
+     - RULE: Must never block. vTaskDelay() here = BAD.
+       It would stall all other timers in the system.
+
+  3. roll_task (spawned by timer callback, self-deletes)
+     - Created by xTaskCreate() inside roll_timer_cb()
+     - Has its own stack: 4096 bytes
+     - Sets s_rolling = true
+     - Calls beacon_stop_advertising()
+     - vTaskDelay(50ms) — safe here because it's its own task
+     - Calls beacon_start_advertising()
+     - Sets s_rolling = false
+     - Calls vTaskDelete(NULL) — self-deletes, frees memory
+
+  4. BLE stack tasks (created internally by bluedroid)
+     - Handle the actual radio transmission
+     - Call gap_event_handler() on advertising state changes
+
+THE s_rolling FLAG:
+  Without this flag, the sequence was:
+    t=60s: roll_timer stops advertising → s_adv_active=false
+    t=60s: app_main watchdog sees false → also tries to restart
+    Result: two concurrent beacon_start_advertising() calls
+            → double "Advertising active" in serial log
+
+  With the flag:
+    roll_timer sets s_rolling=true before stopping
+    app_main watchdog checks: if (!s_rolling) → skip recovery
+    roll_task finishes → sets s_rolling=false
+    Normal watchdog resumes
+
+--- 3.6 GAP EVENT HANDLER ---
+
+The BLE stack communicates state changes via callbacks:
+
+  ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT:
+    Triggered after esp_ble_gap_config_adv_data_raw() finishes.
+    We MUST start advertising from here, not directly after
+    the config call (it's asynchronous).
+    Action: call esp_ble_gap_start_advertising()
+
+  ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
+    Triggered when advertising actually starts (or fails).
+    On success: set s_adv_active = true, blink LED once
+    On failure: log error (will be caught by watchdog)
+
+  ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
+    Triggered when advertising stops.
+    Action: set s_adv_active = false
+
+================================================================
+  SECTION 4: SENSOR NODE FIRMWARE LOGIC (sensor_main.c)
+================================================================
+
+TARGET CHIP: ESP32-C3
+FRAMEWORK: ESP-IDF v5.x (C language)
+
+NOTE ON ESP32-C3 vs ESP32:
+  ESP32-C3 has ONLY BLE (no Classic Bluetooth).
+  Therefore: do NOT call esp_bt_controller_mem_release()
+  because there is no Classic BT memory to release.
+  The BLE init sequence is slightly simpler.
+
+--- 4.1 BLE PASSIVE SCANNING ---
+
+The sensor node scans for BLE advertisements continuously.
+PASSIVE scan is used (not ACTIVE):
+
+  Active scan: scanner sends "scan request" to advertiser
+               → advertiser can detect it's being scanned
+               → more power consumption
+               → not needed here
+
+  Passive scan: scanner only listens, never transmits
+                → completely silent from beacon's perspective
+                → lower power consumption on sensor node
+                → sufficient for RSSI measurement
+
+Scan parameters:
+  scan_interval = 0x50 * 0.625ms = 50ms
+  scan_window   = 0x30 * 0.625ms = 30ms
+  Duty cycle = 30/50 = 60% — balanced between power and coverage
+  scan_duplicate = DISABLE — receive all packets including repeats
+                             (needed to track RSSI over time)
+
+--- 4.2 RAW AD STRUCTURE PARSING ---
+
+Unlike Python/Bleak which parses AD structures automatically,
+in C we parse the raw advertising payload manually.
+
+The raw adv[] buffer from esp_ble_gap_cb_param_t contains
+concatenated AD structures:
+  [len1][type1][data1...][len2][type2][data2...]...
+
+Parsing loop:
+  pos = 0
+  while pos + 1 < adv_len:
+    ad_len  = adv[pos]       -- length of this AD structure
+    ad_type = adv[pos + 1]   -- type byte
+    if ad_type == 0xFF:       -- manufacturer specific
+      company_id = adv[pos+2] | (adv[pos+3] << 8)  -- little-endian
+      if company_id == COMPANY_ID (0x05AC):
+        payload_raw = &adv[pos + 4]  -- skip len+type+cid
+        payload_len = ad_len - 3     -- subtract type(1)+cid(2)
+        → parse our beacon_payload_t
+    pos += ad_len + 1  -- advance past this structure
+
+CRITICAL OFFSET NOTE:
+  ad_len includes: type(1 byte) + cid(2 bytes) + payload(N bytes)
+  So payload bytes = ad_len - 3
+  And payload starts at: &adv[pos + 4]  (skip len+type+cid_lo+cid_hi)
+
+--- 4.3 KALMAN FILTER FOR RSSI SMOOTHING ---
+
+PROBLEM WITH RAW RSSI:
+  BLE RSSI is extremely noisy. A device standing still can show
+  fluctuations of ±5-10 dBm between consecutive packets due to:
+  - Multipath interference (reflections from walls/furniture)
+  - Other 2.4GHz interference (WiFi, microwave ovens)
+  - Antenna orientation changes
+  - Bluetooth frequency hopping
+
+WHY KALMAN FILTER (not moving average):
+  Moving average: treats all samples equally, slow to react
+                  to genuine position changes
+  Kalman filter:  adaptively weights new measurements based on
+                  estimated uncertainty. Reacts faster to real
+                  changes, smoother during stable periods.
+
+KALMAN FILTER MATH (simplified 1D scalar version):
+
+  State: x = estimated true RSSI
+  Uncertainty: p = how uncertain we are about x
+
+  Each new measurement z (raw RSSI):
+
+  PREDICT step:
+    p = p + Q
+    (uncertainty grows over time — signal might have changed)
+
+  UPDATE step:
+    K = p / (p + R)    ← Kalman gain (0 to 1)
+    x = x + K * (z - x)  ← update estimate
+    p = (1 - K) * p    ← reduce uncertainty
+
+  WHERE:
+    Q = process noise covariance (0.1 in our system)
+        How fast can RSSI truly change? Higher Q = more reactive
+    R = measurement noise covariance (2.0 in our system)
+        How noisy is the sensor? Higher R = smoother output
+
+  INTUITION FOR K (Kalman gain):
+    If p >> R: K → 1, trust the measurement more
+    If p << R: K → 0, trust the current estimate more
+    K self-adjusts every iteration — that's the "smart" part
+
+  INITIALIZATION:
+    x = -70.0 dBm (typical RSSI starting estimate)
+    p = 1.0 (moderate initial uncertainty)
+
+--- 4.4 BEACON TRACKING TABLE ---
+
+The sensor node tracks up to MAX_BEACONS (8) simultaneously.
+Each slot stores:
+
+  active        : bool — is this slot in use?
+  device_id     : uint8 — which beacon
+  rssi_raw      : int — last raw RSSI
+  rssi_filtered : float — Kalman output
+  state         : enum — ROOM/NEAR/FAR/NO_SIGNAL
+  hmac_ok       : bool — was last packet verified?
+  last_ts_beacon: uint32 — beacon's uptime at last packet
+  last_seen_us  : int64 — our uptime at last packet (microseconds)
+  packet_count  : uint32 — total packets received
+  kalman        : kalman_t — filter state for this beacon
+  needs_publish : bool — new data ready to send to MQTT
+
+LOOKUP LOGIC:
+  find_or_create_beacon(device_id):
+    1. Scan table for existing entry with matching device_id
+    2. If found → return pointer to it
+    3. If not found → find first slot with active=false
+    4. Initialize new slot, return pointer
+    5. If table is full → log warning, return NULL
+
+--- 4.5 CONCURRENCY AND MUTEX ---
+
+Two execution contexts access s_beacons[] simultaneously:
+
+  ble_gap_cb()   — runs in BLE stack task context
+                   called on every received advertisement
+                   WRITES to s_beacons[]
+
+  publish_task() — runs in its own FreeRTOS task
+                   reads s_beacons[] every 500ms
+                   publishes to MQTT
+
+WITHOUT PROTECTION: data corruption possible
+  Example: publish_task reads rssi_filtered mid-write by
+  ble_gap_cb → reads half-updated float → sends wrong RSSI
+
+SOLUTION: FreeRTOS mutex (xSemaphoreCreateMutex)
+
+  ble_gap_cb:
+    xSemaphoreTake(mutex, 10ms timeout)
+    → update beacon entry
+    xSemaphoreGive(mutex)
+
+  publish_task:
+    xSemaphoreTake(mutex, 20ms timeout)
+    → read all beacon entries, publish
+    xSemaphoreGive(mutex)
+
+TIMEOUT on Take() is important:
+  If mutex is held too long (bug), task doesn't deadlock forever.
+  10ms in BLE callback is conservative but safe.
+
+--- 4.6 MQTT PUBLISHING ---
+
+Library: esp-mqtt (built into ESP-IDF)
+Protocol: MQTT v3.1.1
+QoS: 1 (at least once delivery) — important for actuator commands
+Retain: 0 (no retained messages — controller gets live data only)
+
+Topic format:
+  presence/node{NODE_ID}/beacon/{device_id}
+
+publish_task runs every MQTT_PUBLISH_MS (500ms):
+  For each active beacon:
+    1. Check if timed out (now - last_seen > 5s)
+       If yes: set state = NO_SIGNAL, needs_publish = true
+    2. If needs_publish == false: skip this beacon
+    3. Build JSON string with snprintf()
+    4. Call esp_mqtt_client_publish()
+    5. Set needs_publish = false
+
+WHY needs_publish FLAG?
+  Without it: publish_task sends the same RSSI every 500ms
+              even if beacon hasn't moved → wastes bandwidth
+  With it: only publish when ble_gap_cb received new data
+           OR when timeout state changes
+
+MQTT RECONNECTION:
+  esp-mqtt handles reconnection automatically when broker
+  disconnects. s_mqtt_connected flag is updated in event handler.
+  publish_task checks this flag — if false, skips publish loop.
+
+--- 4.7 WiFi INITIALIZATION ---
+
+Uses esp_wifi (station mode only):
+  1. esp_netif_init() — initialize TCP/IP stack
+  2. esp_event_loop_create_default() — event loop for callbacks
+  3. esp_netif_create_default_wifi_sta() — create STA interface
+  4. esp_wifi_init() — initialize WiFi driver
+  5. Register event handlers for WIFI_EVENT and IP_EVENT
+  6. esp_wifi_start() → triggers WIFI_EVENT_STA_START
+  7. Event handler calls esp_wifi_connect()
+  8. On IP_EVENT_STA_GOT_IP: set WIFI_CONNECTED_BIT
+  9. app_main waits on EventGroup with 15s timeout
+
+RECONNECTION LOGIC:
+  On WIFI_EVENT_STA_DISCONNECTED:
+    if retries < WIFI_RETRY_MAX (5): retry connect
+    else: set WIFI_FAIL_BIT (give up for now)
+  This prevents infinite reconnect storms.
+
+================================================================
+  SECTION 5: PYTHON MONITOR LOGIC (ble_monitor.py)
+================================================================
+
+LIBRARY: Bleak (cross-platform BLE for Python)
+         Rich (terminal UI)
+
+PURPOSE: Laptop-side tool for testing beacon signal before
+         deploying sensor node hardware.
+
+--- 5.1 BLEAK SCANNING ---
+
+BleakScanner(callback) runs asynchronously.
+callback(device, advertisement_data) is called for every
+BLE advertisement received by the laptop's Bluetooth adapter.
+
+FILTERING:
+  Only process devices whose name contains TARGET string.
+  Filter invalid RSSI: skip if rssi in (0, 127, None)
+    - 0 means "not measured"
+    - 127 means "not available" (Bluetooth spec sentinel value)
+
+--- 5.2 MANUFACTURER DATA ACCESS ---
+
+In Bleak, advertisement_data.manufacturer_data is a dict:
+  { company_id (int): bytes }
+
+To access our beacon data:
+  raw = adv.manufacturer_data.get(0x05AC, b"")
+  if not raw: return  # not our beacon
+
+Bleak AUTOMATICALLY strips the company ID from the raw bytes.
+So raw[0] = magic byte (0xBE), NOT the company ID byte.
+This is different from C where we parse the full AD structure.
+
+--- 5.3 HMAC VERIFICATION IN PYTHON ---
+
+CRITICAL BUG HISTORY (documented for future LLMs):
+
+  BUG 1: import name collision
+    Wrong:   import hmac
+             hmac.new(...)  # works but ambiguous
+    Fixed:   import hmac as hmac_mod
+             hmac_mod.new(...)
+
+  BUG 2: Minimum length check was 10, should be 11
+    The payload is 11 bytes:
+      magic(1) + version(1) + device_id(1) + timestamp(4) + hmac(4) = 11
+    Wrong:  if len(raw) < 10: return None
+    Fixed:  if len(raw) < 11: return None
+
+  BUG 3: .encode() vs .encode("utf-8")
+    On Windows, default encoding may not be UTF-8.
+    Always use explicit: SECRET_KEY.encode("utf-8")
+
+BYTE OFFSETS IN PYTHON (raw = mfr_data[0x05AC]):
+  raw[0]    = magic      (0xBE)
+  raw[1]    = version    (0x01)
+  raw[2]    = device_id
+  raw[3:7]  = timestamp  (struct.unpack_from("<I", raw, 3)[0])
+  raw[7:11] = hmac bytes (4 bytes)
+
+--- 5.4 KALMAN FILTER IN PYTHON ---
+
+class KalmanRSSI:
+  Same math as C implementation.
+  One instance per beacon (tracked by MAC address).
+  Initialized with x=-70.0, p=1.0, q=0.1, r=2.0
+
+--- 5.5 MULTI-BEACON TRACKING ---
+
+Beacons are tracked by MAC address (device.address).
+One BeaconState object per address, stored in dict:
+  self.beacons: dict[str, BeaconState]
+
+This is different from sensor node which tracks by device_id.
+Python uses MAC address because it has full BLE device info.
+C firmware uses device_id from payload (MAC not always reliable
+in ESP-IDF scan results due to address randomization).
+
+================================================================
+  SECTION 6: CONTROLLER LOGIC (Python - to be implemented)
+================================================================
+
+The controller subscribes to all MQTT topics:
+  topic: presence/#
+
+For each message received:
+  1. Parse JSON payload
+  2. Update internal state: room_rssi[node_id] = rssi_filtered
+  3. Find node_id with maximum rssi_filtered where state != NO_SIGNAL
+  4. That node's room = active room
+  5. Trigger actuator for active room ON, all others OFF
+
+PSEUDO-CODE:
+  room_state = {}  # {node_id: {rssi, state, last_update}}
+
+  on_message(topic, payload):
+    data = json.parse(payload)
+    room_state[data.node_id] = data
+
+  def get_active_room():
+    candidates = [r for r in room_state.values()
+                  if r.state != "NO_SIGNAL"
+                  and time.now() - r.last_update < 10s]
+    if not candidates: return None  # all empty
+    return max(candidates, key=lambda r: r.rssi_filtered).node_id
+
+ENERGY CALCULATION (for dashboard):
+  power_ac_watt = 900       # 1 PK AC = 900W
+  power_lamp_watt = 20      # LED lamp
+  saved_hours = uptime_hours * (num_rooms - 1) / num_rooms
+  saved_kwh = (power_ac_watt + power_lamp_watt) * saved_hours / 1000
+  saved_rupiah = saved_kwh * 1444  # PLN rate Rp 1444/kWh
+  saved_co2_gram = saved_kwh * 785  # Indonesia grid: 785g CO2/kWh
+
+================================================================
+  SECTION 7: CALIBRATION GUIDE
+================================================================
+
+RSSI THRESHOLDS ARE ENVIRONMENT-DEPENDENT.
+The default values (-65 for ROOM, -80 for NEAR) are starting
+points. They MUST be calibrated per deployment location.
+
+CALIBRATION PROCEDURE:
+  1. Place beacon in center of target room
+  2. Place sensor node at intended installation position
+  3. Run ble_monitor.py --debug for 60 seconds
+  4. Note the rssi_filtered value → this is your ROOM threshold
+     (use value - 5 dBm as threshold for safety margin)
+  5. Move beacon to adjacent room
+  6. Note rssi_filtered → this is between NEAR and FAR
+  7. Set NEAR threshold between step 4 and step 6 values
+
+FACTORS THAT AFFECT RSSI:
+  - Concrete walls: -15 to -20 dBm attenuation per wall
+  - Gypsum/wood walls: -5 to -10 dBm per wall
+  - Human body blocking signal: -3 to -5 dBm
+  - Metal furniture: significant reflection/absorption
+  - Distance (free space): -20 dBm per 10x distance increase
+
+ADAPTIVE THRESHOLD (future improvement):
+  Run 60-second calibration on startup:
+  - Sample RSSI from each node
+  - Compute mean and standard deviation
+  - Set threshold = mean - 1.5 * std_dev
+  This adjusts automatically per environment.
+
+================================================================
+  SECTION 8: HARDWARE CONNECTIONS
+================================================================
+
+BEACON (ESP32):
+  - No external connections needed
+  - LED_GPIO = GPIO_NUM_2 (onboard LED on most ESP32 devkits)
+  - Powered via USB or LiPo battery
+  - Estimated power: ~80mA active advertising
+
+SENSOR NODE (ESP32-C3):
+  - No external BLE connections (passive scan only)
+  - LED_GPIO = GPIO_NUM_8 (onboard LED on ESP32-C3 devkits)
+  - WiFi connection to same network as MQTT broker
+  - Powered via USB or 5V supply
+  - Estimated power: ~120mA (WiFi + BLE scanning)
+
+ACTUATOR (relay module):
+  - IN pin connected to controller GPIO
+  - COM + NO (normally open) in series with device power
+  - HIGH signal = relay closes = device ON
+  - Use optocoupler relay for safety with AC mains
+
+MQTT BROKER:
+  - Mosquitto on Raspberry Pi or laptop
+  - Install: sudo apt install mosquitto mosquitto-clients
+  - Start: mosquitto -v
+  - Default port: 1883 (no TLS for local network)
+  - Test subscribe: mosquitto_sub -h localhost -t "presence/#" -v
+
+================================================================
+  SECTION 9: KNOWN LIMITATIONS
+================================================================
+
+1. SINGLE USER ONLY (current implementation)
+   One beacon = one person tracked.
+   Multi-user requires multiple beacons with different DEVICE_IDs
+   and controller logic to handle multiple active rooms.
+
+2. RSSI NOISE
+   Even with Kalman filter, RSSI can fluctuate ±3-5 dBm.
+   This may cause brief wrong room classifications ("flickering").
+   Mitigation: add hysteresis — only change active room if
+   new room's RSSI exceeds current room's RSSI by +5 dBm
+   for at least 3 consecutive readings.
+
+3. HMAC SECURITY
+   4-byte truncated HMAC is not cryptographically strong.
+   Sufficient for hackathon/demo. Not for production.
+
+4. NO ENCRYPTION
+   BLE advertising is broadcast — anyone with a BLE scanner
+   can see the packets. Rolling ID prevents tracking but
+   the RSSI data and device presence are observable.
+
+5. MQTT WITHOUT TLS
+   Local network only. Adding TLS requires certificate
+   management (not covered in this implementation).
+
+6. BEACON BATTERY LIFE
+   ESP32 advertising at 100ms interval: ~80mA = ~12h on 1000mAh
+   For longer life: increase ADV_INTERVAL (reduces scan frequency)
+   or implement deep sleep with timed wake cycles.
+
+7. WALL PENETRATION VARIABILITY
+   Different wall materials give different RSSI attenuation.
+   A calibrated threshold in one building may not work in another.
+
+================================================================
+  SECTION 10: QUICK REFERENCE — CRITICAL VALUES
+================================================================
+
+MUST MATCH ACROSS ALL DEVICES:
+  SECRET_KEY   = "hackathon2025"    (beacon + sensor + python)
+  COMPANY_ID   = 0x05AC             (beacon + sensor + python)
+  PAYLOAD_MAGIC = 0xBE              (beacon + sensor + python)
+
+UNIQUE PER DEVICE:
+  DEVICE_ID    = 0x01..0xFF         (each beacon unique)
+  NODE_ID      = 1,2,3...           (each sensor node unique)
+
+TUNABLE PARAMETERS:
+  RSSI_THRESHOLD_ROOM = -65         (calibrate per environment)
+  RSSI_THRESHOLD_NEAR = -80         (calibrate per environment)
+  SIGNAL_TIMEOUT_MS   = 5000        (how long before NO_SIGNAL)
+  ROLL_INTERVAL_MS    = 60000       (rolling ID period)
+  KALMAN_Q            = 0.1         (filter reactivity)
+  KALMAN_R            = 2.0         (filter smoothness)
+  ADV_INTERVAL_MIN    = 0x00A0      (100ms — beacon frequency)
+
+FILE STRUCTURE:
+  beacon_firmware/
+  ├── CMakeLists.txt
+  └── main/
+      ├── CMakeLists.txt
+      └── beacon_main.c
+
+  sensor_node/
+  ├── CMakeLists.txt
+  └── main/
+      ├── CMakeLists.txt
+      └── sensor_main.c
+
+  controller/
+  └── ble_monitor.py        (laptop testing tool)
+
+BUILD COMMANDS:
+  Beacon:       idf.py set-target esp32
+  Sensor node:  idf.py set-target esp32c3
+  Both:         idf.py build && idf.py -p /dev/ttyUSB0 flash monitor
+
+MQTT TEST COMMANDS:
+  Subscribe all: mosquitto_sub -h 192.168.1.100 -t "presence/#" -v
+  Manual pub:    mosquitto_pub -h 192.168.1.100 -t "test" -m "hello"
+
+================================================================
+  SECTION 11: DEBUGGING GUIDE
+================================================================
+
+PROBLEM: HMAC always FAIL
+  CHECK 1: Are SECRET_KEY identical in beacon and sensor/python?
+  CHECK 2: Are COMPANY_ID identical? (default 0x05AC)
+  CHECK 3: Run python ble_monitor.py --debug
+           Look at raw hex output
+           raw[0] should be 0xBE (magic byte)
+           If raw is empty: company ID mismatch
+           If raw[0] != 0xBE: wrong AD structure parsed
+  CHECK 4: Payload length — raw must be >= 11 bytes
+  CHECK 5: Byte order — timestamp is little-endian uint32
+
+PROBLEM: Double "Advertising active" in serial log
+  This was a known bug — fixed with s_rolling flag.
+  If still occurring: check that roll_task sets s_rolling=true
+  BEFORE calling beacon_stop_advertising().
+
+PROBLEM: Sensor node not receiving beacon packets
+  CHECK 1: Are both devices on BLE (2.4GHz)? No interference?
+  CHECK 2: Is beacon actually advertising? Check serial log.
+  CHECK 3: Scan window/interval — try scan_window = scan_interval
+           (100% duty cycle) for debugging
+  CHECK 4: RSSI filter — is rssi == 0 or 127? If so, skipped.
+
+PROBLEM: MQTT not connecting
+  CHECK 1: Broker IP correct in MQTT_BROKER_URI?
+  CHECK 2: Same WiFi network as broker?
+  CHECK 3: Firewall blocking port 1883?
+  CHECK 4: mosquitto running? Check: ps aux | grep mosquitto
+  CHECK 5: Check serial log for MQTT_EVENT_ERROR details
+
+PROBLEM: RSSI values seem wrong / flickering state
+  This is normal BLE behavior. Mitigation:
+  - Increase KALMAN_R (more smoothing, less reactive)
+  - Add hysteresis in controller (see Section 9)
+  - Check for WiFi interference (both use 2.4GHz)
+  - Move beacon and sensor away from WiFi routers
+
+================================================================
+  END OF DOCUMENT
+================================================================
+  Total system: 3 firmware files (C) + 1 Python monitor
+  Dependencies: ESP-IDF v5.x, Bleak, Rich, Mosquitto
+  Estimated implementation time: 5-7 days for full system
+  Competition readiness: HIGH — hardware-proven approach
+================================================================
