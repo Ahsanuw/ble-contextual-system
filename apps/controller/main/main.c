@@ -97,13 +97,13 @@
 static const gpio_num_t RELAY_LIGHT[NUM_ROOMS] = {
     GPIO_NUM_18,   /* room 1 light */
     GPIO_NUM_21,   /* room 2 light */
-    GPIO_NUM_23,   /* room 3 light */
+    GPIO_NUM_43,   /* room 3 light */
 };
 
 static const gpio_num_t RELAY_AC[NUM_ROOMS] = {
     GPIO_NUM_19,   /* room 1 AC */
-    GPIO_NUM_22,   /* room 2 AC */
-    GPIO_NUM_25,   /* room 3 AC */
+    GPIO_NUM_42,   /* room 2 AC */
+    GPIO_NUM_45,   /* room 3 AC */
 };
 
 static const char *ROOM_NAME[NUM_ROOMS] = {
