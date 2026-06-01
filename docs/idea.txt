@@ -1,19 +1,15 @@
-================================================================
   PROJECT: Energy-Efficient Context-Aware System
            Using BLE Presence Detection
   DOCUMENTATION FOR LLM CONSUMPTION
   Language: English (technical) + Indonesian (explanations)
   Version: 1.0
-================================================================
 
 This document explains the complete system — architecture,
 firmware logic, signal processing, security, and communication
 stack — so that any LLM or developer can understand, extend,
 or debug the project without needing the original authors.
 
-================================================================
   SECTION 1: PROBLEM STATEMENT
-================================================================
 
 WHAT PROBLEM DOES THIS SOLVE?
 Energy is wasted when lights and air conditioners remain ON
@@ -40,9 +36,7 @@ WHY BLE RSSI WORKS FOR THIS:
   - Room-level granularity (~85-90% accuracy) is sufficient
     for energy control — we don't need sub-meter precision
 
-================================================================
   SECTION 2: SYSTEM ARCHITECTURE
-================================================================
 
 COMPONENTS:
   1. Beacon       — ESP32, carried by person
@@ -90,9 +84,7 @@ CONTROLLER DECISION RULE:
   Turn ON devices in active room, turn OFF all others.
   If all nodes report NO_SIGNAL → person left → turn OFF all.
 
-================================================================
   SECTION 3: BEACON FIRMWARE LOGIC (beacon_main.c)
-================================================================
 
 TARGET CHIP: ESP32 (classic)
 FRAMEWORK: ESP-IDF v5.x (C language)
@@ -269,9 +261,7 @@ The BLE stack communicates state changes via callbacks:
     Triggered when advertising stops.
     Action: set s_adv_active = false
 
-================================================================
   SECTION 4: SENSOR NODE FIRMWARE LOGIC (sensor_main.c)
-================================================================
 
 TARGET CHIP: ESP32-C3
 FRAMEWORK: ESP-IDF v5.x (C language)
@@ -485,9 +475,7 @@ RECONNECTION LOGIC:
     else: set WIFI_FAIL_BIT (give up for now)
   This prevents infinite reconnect storms.
 
-================================================================
   SECTION 5: PYTHON MONITOR LOGIC (ble_monitor.py)
-================================================================
 
 LIBRARY: Bleak (cross-platform BLE for Python)
          Rich (terminal UI)
@@ -565,9 +553,7 @@ Python uses MAC address because it has full BLE device info.
 C firmware uses device_id from payload (MAC not always reliable
 in ESP-IDF scan results due to address randomization).
 
-================================================================
   SECTION 6: CONTROLLER LOGIC (Python - to be implemented)
-================================================================
 
 The controller subscribes to all MQTT topics:
   topic: presence/#
@@ -601,9 +587,7 @@ ENERGY CALCULATION (for dashboard):
   saved_rupiah = saved_kwh * 1444  # PLN rate Rp 1444/kWh
   saved_co2_gram = saved_kwh * 785  # Indonesia grid: 785g CO2/kWh
 
-================================================================
   SECTION 7: CALIBRATION GUIDE
-================================================================
 
 RSSI THRESHOLDS ARE ENVIRONMENT-DEPENDENT.
 The default values (-65 for ROOM, -80 for NEAR) are starting
@@ -633,9 +617,7 @@ ADAPTIVE THRESHOLD (future improvement):
   - Set threshold = mean - 1.5 * std_dev
   This adjusts automatically per environment.
 
-================================================================
   SECTION 8: HARDWARE CONNECTIONS
-================================================================
 
 BEACON (ESP32):
   - No external connections needed
@@ -663,9 +645,7 @@ MQTT BROKER:
   - Default port: 1883 (no TLS for local network)
   - Test subscribe: mosquitto_sub -h localhost -t "presence/#" -v
 
-================================================================
   SECTION 9: KNOWN LIMITATIONS
-================================================================
 
 1. SINGLE USER ONLY (current implementation)
    One beacon = one person tracked.
@@ -701,9 +681,7 @@ MQTT BROKER:
    Different wall materials give different RSSI attenuation.
    A calibrated threshold in one building may not work in another.
 
-================================================================
   SECTION 10: QUICK REFERENCE — CRITICAL VALUES
-================================================================
 
 MUST MATCH ACROSS ALL DEVICES:
   SECRET_KEY   = "hackathon2025"    (beacon + sensor + python)
@@ -748,9 +726,7 @@ MQTT TEST COMMANDS:
   Subscribe all: mosquitto_sub -h 192.168.1.100 -t "presence/#" -v
   Manual pub:    mosquitto_pub -h 192.168.1.100 -t "test" -m "hello"
 
-================================================================
   SECTION 11: DEBUGGING GUIDE
-================================================================
 
 PROBLEM: HMAC always FAIL
   CHECK 1: Are SECRET_KEY identical in beacon and sensor/python?
@@ -789,11 +765,8 @@ PROBLEM: RSSI values seem wrong / flickering state
   - Check for WiFi interference (both use 2.4GHz)
   - Move beacon and sensor away from WiFi routers
 
-================================================================
   END OF DOCUMENT
-================================================================
   Total system: 3 firmware files (C) + 1 Python monitor
   Dependencies: ESP-IDF v5.x, Bleak, Rich, Mosquitto
   Estimated implementation time: 5-7 days for full system
   Competition readiness: HIGH — hardware-proven approach
-================================================================
